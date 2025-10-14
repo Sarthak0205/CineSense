@@ -1,0 +1,56 @@
+.recommend-page {
+  padding: 40px;
+  color: white;
+  text-align: center;
+}
+
+.category-title {
+  font-size: 2rem;
+  margin-bottom: 20px;
+  text-transform: capitalize;
+}
+
+.recommend-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 20px;
+}
+
+.recommend-card {
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 16px;
+  padding: 10px;
+  transition: transform 0.2s ease;
+}
+
+.recommend-card:hover {
+  transform: scale(1.05);
+}
+
+.poster {
+  width: 100%;
+  border-radius: 10px;
+}
+
+.fade-in {
+  animation: fadeIn 0.5s ease-in;
+}
+
+@keyframes fadeIn {
+  from { opacity: 0; transform: translateY(10px); }
+  to { opacity: 1; transform: translateY(0); }
+}
+
+.animate-fadeIn {
+  animation: fadeIn 0.6s ease-out;
+}
+
+.animate-fadeInSlow {
+  animation: fadeIn 1s ease-out;
+}
+
+
+.loader {
+  font-size: 1.2rem;
+  opacity: 0.8;
+}
