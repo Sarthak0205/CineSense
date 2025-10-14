@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.pyc
+
+# Environment files
+.env
+
+# Cache & temp
+cache/
+*.log
+
+# Model and data embeddings
+*.pkl
+*.npy
+
+# Node modules (if using React frontend)
+node_modules/
+
+# IDE files
+.vscode/
+.idea/
+.DS_Store
+
+# Build files
+dist/
+build/
