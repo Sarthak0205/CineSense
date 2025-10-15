@@ -1,79 +1,82 @@
 import pandas as pd
-import re
 
-# 🔹 Path to your dataset
-DATA_PATH = "data/final_dataset.csv"
-OUTPUT_PATH = "data/cleaned_final_dataset.csv"
+DATASET_PATH = "data/final_dataset.csv"  # Adjust to your dataset path
 
-print("📥 Loading dataset...")
-df = pd.read_csv(DATA_PATH)
+def inspect_and_fix_dataset(csv_path):
+    df = pd.read_csv(csv_path)
 
-# 🔹 Normalize columns
-df.columns = [c.lower().strip() for c in df.columns]
+    errors = []
 
-# Drop incomplete or empty titles/descriptions
-df.dropna(subset=["title", "description"], inplace=True)
-df = df[df["title"].str.strip() != ""]
+    # Check required columns exist
+    required_cols = ["title", "genre", "description", "type", "rating", "year"]
+    missing_cols = [c for c in required_cols if c not in df.columns]
+    if missing_cols:
+        errors.append(f"Missing required columns: {missing_cols}")
 
-# 🔹 Normalize the 'type' column
-df["type"] = (
-    df["type"]
-    .astype(str)
-    .str.lower()
-    .replace({
-        "tv": "series",
-        "web series": "series",
-        "show": "series",
-        "film": "movie",
-        "movies": "movie",
-    })
-    .fillna("unknown")
-)
+    # Check empty titles
+    if df["title"].isnull().any() or (df["title"].astype(str).str.strip() == "").any():
+        errors.append("Some titles are missing or empty")
 
-# 🔹 Fix anime detection by checking keywords
-def fix_type(row):
-    text = f"{row['title']} {row['genre']} {row['description']}".lower()
-    if any(k in text for k in ["anime", "manga", "japanese animation"]):
-        return "anime"
-    if any(k in text for k in ["series", "tv", "show", "drama", "episodes"]):
-        return "series"
-    if any(k in text for k in ["movie", "film", "cinema", "sci-fi", "thriller", "comedy", "action"]):
-        return "movie"
-    return row["type"]
+    # Check 'type' values
+    allowed_types = {"movie", "anime", "series"}
+    invalid_types = set(df["type"].dropna().str.lower().unique()) - allowed_types
+    if invalid_types:
+        errors.append(f"Invalid 'type' values found: {invalid_types}")
 
-df["type"] = df.apply(fix_type, axis=1)
+    if not df["type"].dropna().apply(lambda x: x.islower()).all():
+        errors.append("Not all 'type' values are lowercase strings")
 
-# 🔹 Remove wrong-type noise (anime labeled as movie, etc.)
-def remove_wrong_types(row):
-    text = f"{row['title']} {row['genre']}".lower()
-    if row["type"] == "anime" and not any(k in text for k in ["anime", "manga", "japanese animation"]):
-        return None
-    if row["type"] != "anime" and any(k in text for k in ["anime", "manga"]):
-        return None
-    return row["type"]
+    # Check 'rating' numeric range
+    if df["rating"].isnull().any():
+        errors.append("Some rating values are null")
+    elif ((df["rating"] < 0) | (df["rating"] > 10)).any():
+        errors.append("Rating values must be between 0 and 10")
 
-df["type"] = df.apply(remove_wrong_types, axis=1, result_type=None)
-df.dropna(subset=["type"], inplace=True)
+    # Convert year to numeric for checks and fixing
+    df["year"] = pd.to_numeric(df["year"], errors="coerce")
 
-# 🔹 Deduplicate by title
-df = df.drop_duplicates(subset=["title"], keep="first")
+    # Check invalid years: allow 0 as valid fallback
+    invalid_years = df[(df["year"].isnull()) | (df["year"] < 0) | (df["year"] > 2100)]
+    if not invalid_years.empty:
+        errors.append(f"{len(invalid_years)} rows have invalid or missing 'year' values")
 
-# 🔹 Clean text fields
-def clean_text(t):
-    return re.sub(r"\s+", " ", str(t)).strip()
+    # Check duplicate titles ignoring case and whitespace
+    normalized_titles = df["title"].astype(str).str.strip().str.lower()
+    dup_titles = normalized_titles[normalized_titles.duplicated()]
+    if not dup_titles.empty:
+        errors.append(f"Duplicate titles found (case-insensitive): {dup_titles.unique()}")
 
-for col in ["title", "genre", "description"]:
-    df[col] = df[col].apply(clean_text)
+    # Check description completeness
+    if df["description"].isnull().any() or (df["description"].astype(str).str.strip() == "").any():
+        errors.append("Some description fields are missing or empty")
 
-# 🔹 Remove entries with extremely short descriptions
-df = df[df["description"].str.len() > 25]
+    # Print current errors
+    if len(errors) == 0:
+        print("✅ Dataset passed all inspection checks!")
+    else:
+        print("❌ Dataset inspection issues:")
+        for e in errors:
+            print(f" - {e}")
 
-# 🔹 Reset index
-df.reset_index(drop=True, inplace=True)
+    # Auto-fix invalid years by setting them to 0
+    if not invalid_years.empty:
+        print(f"Fixing {len(invalid_years)} invalid/missing year entries by setting to 0...")
+        df.loc[(df["year"].isnull()) | (df["year"] < 0) | (df["year"] > 2100), "year"] = 0
+        df["year"] = df["year"].astype(int)
 
-print(f"✅ Cleaned dataset: {len(df)} entries remaining")
-print(df["type"].value_counts())
+        # Save fixed dataset overwrite
+        df.to_csv(csv_path, index=False)
+        print(f"Dataset saved after fixing year values to '{csv_path}'")
 
-# 🔹 Save cleaned version
-df.to_csv(OUTPUT_PATH, index=False)
-print(f"💾 Cleaned dataset saved → {OUTPUT_PATH}")
+        # Re-check invalid years (allowing 0)
+        invalid_years_after = df[(df["year"] < 0) | (df["year"] > 2100)]
+
+        if invalid_years_after.empty:
+            print("✅ All 'year' values are now valid after fix.")
+        else:
+            print(f"❌ {len(invalid_years_after)} 'year' values remain invalid after fix.")
+
+    return df
+
+if __name__ == "__main__":
+    inspect_and_fix_dataset(DATASET_PATH)
