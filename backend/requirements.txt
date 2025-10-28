@@ -18,3 +18,35 @@ Flask-Cors==4.0.1
 # Utility
 requests==2.32.3
 tqdm==4.66.4
+# Core ML / Embedding
+torch>=2.0.0            # core runtime for embeddings (CPU or GPU builds)
+sentence-transformers>=2.2.2
+
+# Data handling & ML utilities
+pandas>=1.5.3
+scikit-learn>=1.2.2
+
+# Similarity utils (used by sentence-transformers & helpful for fuzzy matching)
+transformers>=4.30.0
+huggingface-hub>=0.14.0
+tokenizers>=0.14.0
+
+# Visualization & plotting (for cluster visualizations)
+matplotlib>=3.6.0
+seaborn>=0.12.0
+
+# CLI/progress
+tqdm>=4.65.0
+
+# Web API (optional, recommended if you expose the recommender through Flask)
+Flask>=2.2.5
+gunicorn>=21.0.0
+
+# Optional fuzzy matching & performance helpers
+rapidfuzz>=2.13.0
+
+# Dev / testing (optional)
+pytest>=7.2.0
+black>=23.3.0
+isort>=5.12.0
+mypy>=1.9.0
