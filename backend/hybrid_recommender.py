@@ -1,266 +1,177 @@
-# hybrid_recommender.py
-
 import os
-import re
-import pickle
-import numpy as np
 import pandas as pd
-from sklearn.cluster import KMeans
-from sklearn.metrics.pairwise import cosine_similarity
+import torch
+from sentence_transformers import SentenceTransformer, util
 
-try:
-    from sentence_transformers import SentenceTransformer
-    HAS_S_BERT = True
-except Exception:
-    HAS_S_BERT = False
+# =====================================================
+# 1️⃣ Load Dataset
+# =====================================================
+print("📥 Loading clustered dataset...")
+DATA_PATH = "data/final_dataset_clustered.csv"
+EMBED_CACHE = "data/embeddings_cache.pt"
 
+df = pd.read_csv(DATA_PATH)
 
-class HybridRecommender:
-    def __init__(
-        self,
-        dataset_path="data/final_dataset.csv",
-        embeddings_path="data/embeddings.npy",
-        clusters_path="data/kmeans.pkl",
-        n_clusters=20,
-        sbert_model_name="all-MiniLM-L6-v2",
-        recompute=False
-    ):
-        print("📥 Loading dataset...")
-        if not os.path.exists(dataset_path):
-            raise FileNotFoundError(f"Dataset not found: {dataset_path}")
+required_cols = ["title", "combined_text", "cluster_id", "genres", "type", "overview", "rating"]
+missing = [c for c in required_cols if c not in df.columns]
+if missing:
+    raise ValueError(f"❌ Missing columns: {missing}")
 
-        self.data = pd.read_csv(dataset_path)
-        self.dataset_path = dataset_path
-        self.embeddings_path = embeddings_path
-        self.clusters_path = clusters_path
-        self.n_clusters = n_clusters
-        self.sbert_model_name = sbert_model_name
+df.dropna(subset=["title", "combined_text"], inplace=True)
+df.reset_index(drop=True, inplace=True)
 
-        # Basic cleanup
-        for col in ["title", "genre", "description", "type", "rating", "year"]:
-            if col not in self.data.columns:
-                self.data[col] = "" if col in ["title", "genre", "description", "type"] else 0
+print(f"✅ Loaded {len(df)} titles across {df['cluster_id'].nunique()} clusters.")
 
-        self.data["title"] = self.data["title"].astype(str).str.strip()
-        self.data["type"] = self.data["type"].astype(str).str.lower().fillna("unknown")
-        self.data["type"] = self.data["type"].replace({
-            "movies": "movie", "films": "movie", "film": "movie",
-            "tv": "series", "tv show": "series", "web series": "series",
-            "animes": "anime"
-        })
+# =====================================================
+# 2️⃣ Load or Generate Embeddings (Cached)
+# =====================================================
+print("⚙️ Loading SentenceTransformer model...")
+model = SentenceTransformer("all-MiniLM-L6-v2")
 
-        # Detect anime more reliably
-        def detect_anime(row):
-            t = str(row.get("type", "")).lower()
-            txt = f"{row.get('title','')} {row.get('genre','')} {row.get('description','')}".lower()
-            if "anime" in t or "manga" in txt or "japan" in txt:
-                return "anime"
-            return t or "unknown"
-        self.data["type"] = self.data.apply(detect_anime, axis=1)
+if os.path.exists(EMBED_CACHE):
+    print("📦 Loading cached embeddings...")
+    embeddings = torch.load(EMBED_CACHE)
+else:
+    print("🧠 Generating fresh embeddings (this may take several minutes)...")
+    embeddings = model.encode(df["combined_text"].tolist(), show_progress_bar=True, convert_to_tensor=True)
+    torch.save(embeddings, EMBED_CACHE)
+    print(f"💾 Embeddings cached → {EMBED_CACHE}")
 
-        self._prepare_stats()
+df["embedding_idx"] = range(len(df))
 
-        # --- Load or compute embeddings ---
-        if HAS_S_BERT:
-            if not recompute and os.path.exists(embeddings_path):
-                print("✅ Loading precomputed embeddings...")
-                self.embeddings = np.load(embeddings_path)
-            else:
-                print("🔹 Computing embeddings...")
-                self.sbert = SentenceTransformer(sbert_model_name)
-                texts = (self.data["title"].fillna("") + " " +
-                         self.data["genre"].fillna("") + " " +
-                         self.data["description"].fillna("")).tolist()
-                self.embeddings = self.sbert.encode(texts, show_progress_bar=True, convert_to_numpy=True)
-                os.makedirs(os.path.dirname(embeddings_path) or ".", exist_ok=True)
-                np.save(embeddings_path, self.embeddings)
-                print(f"✅ Saved embeddings to {embeddings_path}")
-        else:
-            raise RuntimeError("SentenceTransformer not installed — please install 'sentence-transformers'.")
+# =====================================================
+# 3️⃣ Cluster Name Mapping (Optional)
+# =====================================================
+cluster_labels = {
+    0: "Animated & Family",
+    1: "Crime & Action Thrillers",
+    2: "Emotional Drama / Slice of Life",
+    3: "Psychological Horror",
+    6: "Workplace & Situational Comedy",
+    9: "Reality / Music / Performance",
+    10: "Sci-Fi & Adventure",
+    11: "Mystery / Investigative Thrillers",
+    13: "Romantic / Relationship Stories",
+    14: "Family Dramas & Lighthearted Shows",
+}
 
-        # --- Load or compute clusters ---
-        if not recompute and os.path.exists(clusters_path):
-            print("✅ Loading precomputed clusters...")
-            with open(clusters_path, "rb") as f:
-                saved = pickle.load(f)
-            self.kmeans = saved["kmeans"]
-            self.data["cluster"] = saved["clusters"]
-        else:
-            print("🔹 Performing KMeans clustering...")
-            km = KMeans(n_clusters=min(n_clusters, max(2, len(self.data)//20)), random_state=42, n_init=10)
-            clusters = km.fit_predict(self.embeddings)
-            self.kmeans = km
-            self.data["cluster"] = clusters
-            with open(clusters_path, "wb") as f:
-                pickle.dump({"kmeans": self.kmeans, "clusters": clusters}, f, protocol=pickle.HIGHEST_PROTOCOL)
-            print(f"✅ Saved clusters to {clusters_path}")
+# =====================================================
+# 4️⃣ Hybrid Recommendation Logic with type restriction and duplicate filtering
+# =====================================================
+def recommend(title, category=None, top_k=5, expand_clusters=True):
+    """
+    Return top_k recommendations based on semantic + cluster similarity.
+    Enforces type restriction:
+     - If `category` is provided → force recommend only same category
+     - Else → use dataset type of the input title
+    """
+    matches = df[df["title"].str.lower() == title.lower()]
+    if matches.empty:
+        return {"success": False, "message": f"'{title}' not found in dataset.", "results": []}
 
-        # Build quick lookup maps
-        self.title_map = {t.lower(): i for i, t in enumerate(self.data["title"].astype(str))}
-        self._compute_normalizers()
-        print("✅ Model initialized and ready!")
+    idx = matches.index[0]
+    query = df.loc[idx]
+    query_emb = embeddings[query["embedding_idx"]]
+    query_cluster = query["cluster_id"]
 
-    # ─────────────────────────────
-    # Preprocessing helpers
-    # ─────────────────────────────
-    def _prepare_stats(self):
-        if "rating" in self.data.columns:
-            self.data["rating"] = pd.to_numeric(self.data["rating"], errors="coerce").fillna(0.0)
-        else:
-            self.data["rating"] = 0.0
-        if "popularity" not in self.data.columns:
-            if "members" in self.data.columns:
-                self.data["popularity"] = pd.to_numeric(self.data["members"], errors="coerce").fillna(0)
-            elif "score" in self.data.columns:
-                self.data["popularity"] = pd.to_numeric(self.data["score"], errors="coerce").fillna(0)
-            else:
-                self.data["popularity"] = 0
-        else:
-            self.data["popularity"] = pd.to_numeric(self.data["popularity"], errors="coerce").fillna(0)
-        if "year" not in self.data.columns:
-            if "release_date" in self.data.columns:
-                self.data["year"] = pd.to_datetime(self.data["release_date"], errors="coerce").dt.year.fillna(0).astype(int)
-            else:
-                self.data["year"] = 0
-        else:
-            self.data["year"] = pd.to_numeric(self.data["year"], errors="coerce").fillna(0).astype(int)
+    # ✅ Normalize dataset type column
+    df["type"] = df["type"].astype(str).str.strip().str.lower()
 
-    def _compute_normalizers(self):
-        self.rating_max = max(self.data["rating"].max(), 1)
-        self.pop_max = max(self.data["popularity"].max(), 1)
-        years = self.data["year"]
-        self.year_max = years.max() if years.max() > 0 else 2025
-        self.year_min = years[years > 0].min() if any(years > 0) else self.year_max
-
-    # ─────────────────────────────
-    # Utility and scoring
-    # ─────────────────────────────
-    def find_title_index(self, query_title):
-        q = str(query_title).strip().lower()
-        if q in self.title_map:
-            return self.title_map[q]
-        try:
-            import difflib
-            candidates = difflib.get_close_matches(q, list(self.title_map.keys()), n=1, cutoff=0.6)
-            if candidates:
-                return self.title_map[candidates[0]]
-        except Exception:
-            pass
-        return None
-
-    def _normalize_rating(self, r): return float(r) / self.rating_max
-    def _normalize_pop(self, p): return float(p) / self.pop_max
-    def _recency_score(self, y):
-        try: y = int(y)
-        except: return 0.0
-        if y <= 0: return 0.0
-        if self.year_max == self.year_min: return 0.5
-        return (y - self.year_min) / (self.year_max - self.year_min)
-
-    def _is_same_franchise(self, a, b):
-        a_base = re.sub(r"[:\-–(].*", "", str(a).lower()).strip()
-        b_base = re.sub(r"[:\-–(].*", "", str(b).lower()).strip()
-        if not a_base or not b_base: return False
-        if a_base in b_base or b_base in a_base: return True
-        wa, wb = set(a_base.split()), set(b_base.split())
-        return len(wa & wb) / max(1, len(wa | wb)) >= 0.6
-
-    # ─────────────────────────────
-    # Core recommendation logic
-    # ─────────────────────────────
-    def recommend(self, query_title, content_type=None, top_n=10, sort_mode=None, weights=None, verbose=False):
-        """
-        Returns same-type recommendations with flexible sorting:
-        - content_type: 'anime' | 'movie' | 'series'
-        - sort_mode: 'latest', 'oldest', 'popular', 'top_rated' (optional)
-        """
-        if weights is None:
-            weights = {"sim": 0.5, "rating": 0.25, "pop": 0.15, "recency": 0.10}
-
-        idx = self.find_title_index(query_title)
-        if idx is None:
-            if verbose: print(f"⚠️ '{query_title}' not found.")
-            return None
-
-        query_row = self.data.iloc[idx]
-        query_type = str(query_row.get("type", "unknown"))
-        desired_type = (content_type or query_type).lower().strip()
-
-        # Strict same-type enforcement
-        cluster_id = int(query_row["cluster"])
-        cluster_peers = self.data[(self.data["cluster"] == cluster_id) & (self.data["type"] == desired_type)]
-
-        if cluster_peers.empty:
-            if verbose: print(f"⚠️ No {desired_type} peers in cluster {cluster_id}, using global pool.")
-            cluster_peers = self.data[self.data["type"] == desired_type]
-
-        if cluster_peers.empty:
-            if verbose: print(f"⚠️ No '{desired_type}' items in dataset, fallback to all types.")
-            cluster_peers = self.data.copy()
-
-        # Compute cosine similarity
-        q_vec = self.embeddings[idx].reshape(1, -1)
-        sims = cosine_similarity(q_vec, self.embeddings[cluster_peers.index])[0]
-        cluster_peers = cluster_peers.assign(similarity=sims)
-
-        # Normalize features
-        cluster_peers["rating_norm"] = cluster_peers["rating"].apply(self._normalize_rating)
-        cluster_peers["pop_norm"] = cluster_peers["popularity"].apply(self._normalize_pop)
-        cluster_peers["recency_norm"] = cluster_peers["year"].apply(self._recency_score)
-
-        # Replace missing ratings
-        zero_mask = cluster_peers["rating"] <= 0
-        if zero_mask.any():
-            mean_r = cluster_peers.loc[~zero_mask, "rating"].mean() or self.data["rating"].mean()
-            cluster_peers.loc[zero_mask, "rating_norm"] = self._normalize_rating(mean_r)
-
-        # Weighted score
-        cluster_peers["final_score"] = (
-            weights["sim"] * cluster_peers["similarity"] +
-            weights["rating"] * cluster_peers["rating_norm"] +
-            weights["pop"] * cluster_peers["pop_norm"] +
-            weights["recency"] * cluster_peers["recency_norm"]
+    # ✅ Determine the target type
+    query_type = (
+        category.lower()
+        if category else (
+            str(query["type"]).lower().strip() if isinstance(query["type"], str) else "movie"
         )
+    )
+    valid_types = ["movie", "series", "anime"]
+    if query_type not in valid_types:
+        query_type = "movie"
 
-        # Remove self
-        cluster_peers = cluster_peers[cluster_peers["title"].str.lower() != query_row["title"].lower()]
+    print(f"🔍 Input: {title} | Category: {query_type}")
 
-        # Optional sort modes
-        if sort_mode == "latest":
-            cluster_peers = cluster_peers.sort_values("year", ascending=False)
-        elif sort_mode == "oldest":
-            cluster_peers = cluster_peers.sort_values("year", ascending=True)
-        elif sort_mode == "popular":
-            cluster_peers = cluster_peers.sort_values("popularity", ascending=False)
-        elif sort_mode == "top_rated":
-            cluster_peers = cluster_peers.sort_values("rating", ascending=False)
-        else:
-            cluster_peers = cluster_peers.sort_values("final_score", ascending=False)
+    # ✅ Filter candidates from same cluster + same category/type
+    candidates = df[(df["cluster_id"] == query_cluster) & (df["type"] == query_type)]
 
-        # Deduplicate franchises
-        filtered, seen = [], []
-        for _, r in cluster_peers.iterrows():
-            base = re.sub(r"[:\-–(].*", "", str(r['title']).lower()).strip()
-            if any(self._is_same_franchise(base, s) for s in seen):
-                continue
-            seen.append(base)
-            filtered.append(r)
-            if len(filtered) >= top_n * 3:
+    # Fallback if cluster too small
+    if len(candidates) < 2:
+        candidates = df[df["type"] == query_type]
+
+    cand_emb = embeddings[candidates["embedding_idx"].tolist()]
+
+    # Compute cosine similarities
+    scores = util.cos_sim(query_emb, cand_emb)[0]
+    top_indices = torch.topk(scores, k=min(len(candidates), top_k + 1))
+
+    recs = []
+    seen_titles = set()
+
+    for score, local_idx in zip(top_indices[0], top_indices[1]):
+        item = candidates.iloc[local_idx.item()]
+        low_title = item["title"].lower()
+        if low_title != title.lower() and low_title not in seen_titles:
+            recs.append({
+                "title": item["title"],
+                "type": item["type"],
+                "genres": item.get("genres", ""),
+                "rating": item.get("rating", "N/A"),
+                "overview": (item["overview"][:200] + "...") if isinstance(item["overview"], str) else "",
+                "cluster": cluster_labels.get(item["cluster_id"], "Unknown"),
+                "similarity": round(float(score), 3)
+            })
+            seen_titles.add(low_title)
+
+    # Fallback global search (same type)
+    if len(recs) < top_k and expand_clusters:
+        needed = top_k - len(recs)
+        global_scores = util.cos_sim(query_emb, embeddings)[0]
+
+        type_mask = df["type"] == query_type
+        candidate_indices = df[type_mask].index.tolist()
+
+        filtered_scores = [(i, global_scores[i].item()) for i in candidate_indices]
+        filtered_scores.sort(key=lambda x: x[1], reverse=True)
+
+        for global_idx, score in filtered_scores:
+            item = df.iloc[global_idx]
+            low_title = item["title"].lower()
+            if low_title != title.lower() and low_title not in seen_titles:
+                recs.append({
+                    "title": item["title"],
+                    "type": item["type"],
+                    "genres": item.get("genres", ""),
+                    "rating": item.get("rating", "N/A"),
+                    "overview": (item["overview"][:200] + "...") if isinstance(item["overview"], str) else "",
+                    "cluster": cluster_labels.get(item["cluster_id"], "Unknown"),
+                    "similarity": round(float(score), 3)
+                })
+                seen_titles.add(low_title)
+            if len(recs) >= top_k:
                 break
 
-        if not filtered:
-            return cluster_peers.head(top_n)
+    return {
+        "success": bool(recs),
+        "message": "ok" if recs else "no recommendations found",
+        "results": sorted(recs, key=lambda x: x["similarity"], reverse=True)[:top_k]
+    }
 
-        result = pd.DataFrame(filtered).head(top_n).reset_index(drop=True)
-        return result[["title", "genre", "rating", "year", "similarity", "final_score", "type", "cluster"]]
+# =====================================================
+# 4️⃣.5️⃣ Helper for Fuzzy Matching (for Flask API)
+# =====================================================
+def get_all_titles():
+    """Return all titles in the dataset (used for fuzzy matching)."""
+    return df["title"].dropna().tolist()
 
-    # ─────────────────────────────
-    # For visualization
-    # ─────────────────────────────
-    def cluster_sample(self, cluster_id, n=10):
-        return self.data[self.data["cluster"] == cluster_id].head(n)[["title", "type", "genre", "year"]]
-
-
+# =====================================================
+# 5️⃣ Test Run (CLI)
+# =====================================================
 if __name__ == "__main__":
-    hr = HybridRecommender("data/final_dataset.csv", n_clusters=25)
-    print(hr.recommend("inception", content_type="movie", top_n=10, verbose=True))
+    test_title = "attack on titan"
+    print(f"\n🎬 Recommendations for: {test_title}")
+    result = recommend(test_title, top_k=10)
+
+    if not result["success"]:
+        print(result["message"])
+    else:
+        for r in result["results"]:
+            print(f"➡️ {r['title']} ({r['cluster']}) [{r['similarity']}] - {r['genres']}")

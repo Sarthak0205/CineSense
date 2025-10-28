@@ -1,299 +1,163 @@
 import os
-import time
-import threading
-import hashlib
-import requests
-from urllib.parse import quote
-from flask import Flask, request, jsonify, send_from_directory, Response
-from dotenv import load_dotenv
+import json
+import numpy as np
+from flask import Flask, request, jsonify
 from flask_cors import CORS
-from hybrid_recommender import HybridRecommender
+from dotenv import load_dotenv
+from flask_jwt_extended import JWTManager, jwt_required, get_jwt_identity
+from bson import ObjectId
+from fuzzywuzzy import process  # ✅ Fuzzy matching
 
+from hybrid_recommender import recommend, get_all_titles  # ✅ We'll use this to fetch dataset titles
+from db import init_db, mongo
+from utils.helpers import get_poster_url
+
+# ======================================
+# Flask App Setup
+# ======================================
+app = Flask(__name__)
+CORS(app)
+
+# Load environment variables
 load_dotenv()
-app = Flask(__name__, static_folder=None)
-CORS(app, resources={r"/*": {"origins": "*"}}, supports_credentials=True)
 
-DATA_DIR = os.getenv("DATA_DIR", "data")
-POSTER_CACHE = os.path.join(DATA_DIR, "posters_cache")
-os.makedirs(POSTER_CACHE, exist_ok=True)
-MAX_CACHE_FILES = int(os.getenv("MAX_CACHE_FILES", 400))
+# Flask Configuration
+app.config["MONGO_URI"] = os.getenv("MONGO_URI", "mongodb://localhost:27017/cineSenseDB")
+app.config["JWT_SECRET_KEY"] = os.getenv("JWT_SECRET_KEY", "supersecretkey123")
+app.config["JWT_ACCESS_TOKEN_EXPIRES"] = int(os.getenv("JWT_ACCESS_TOKEN_EXPIRES", 3600))
 
-TMDB_API_KEY = os.getenv("TMDB_API_KEY", "").strip()
-if not TMDB_API_KEY:
-    print("⚠️ Warning: TMDB_API_KEY not set in .env — TMDB poster fetches will fail (Jikan/fallback used).")
+init_db(app)
+jwt = JWTManager(app)
 
-TMDB_SEARCH_MOVIE = "https://api.themoviedb.org/3/search/movie"
-TMDB_SEARCH_TV = "https://api.themoviedb.org/3/search/tv"
-TMDB_IMAGE_BASE = "https://image.tmdb.org/t/p/w500"
-JIKAN_SEARCH = "https://api.jikan.moe/v4/anime"
+# ======================================
+# Register Blueprints
+# ======================================
+from routes.auth_routes import auth_bp
+from routes.favorites_routes import favorites_bp
+from routes.personalized_routes import personal_bp
 
-session = requests.Session()
-session.headers.update({"Accept": "application/json", "User-Agent": "CineSense/1.0"})
-cache_lock = threading.Lock()
-metadata_cache = {}  # in-memory metadata cache
+app.register_blueprint(auth_bp)
+app.register_blueprint(favorites_bp)
+app.register_blueprint(personal_bp)
 
-recommender = HybridRecommender(
-    dataset_path=os.getenv("DATASET_PATH", os.path.join(DATA_DIR, "final_dataset.csv")),
-    embeddings_path=os.getenv("EMBEDDINGS_PATH", os.path.join(DATA_DIR, "embeddings.npy")),
-    clusters_path=os.getenv("CLUSTERS_PATH", os.path.join(DATA_DIR, "kmeans.pkl")),
-    n_clusters=int(os.getenv("N_CLUSTERS", 25)),
-    recompute=False
-)
+# ======================================
+# Routes
+# ======================================
+@app.route("/api", methods=["GET"])
+def home():
+    return jsonify({"message": "🎬 CineSense API running!"})
 
-def _cache_filename(title):
-    h = hashlib.md5(title.encode("utf-8")).hexdigest()
-    return os.path.join(POSTER_CACHE, f"{h}.jpg")
 
-def _manage_cache_size():
-    files = sorted(
-        [os.path.join(POSTER_CACHE, f) for f in os.listdir(POSTER_CACHE)],
-        key=lambda p: os.path.getmtime(p)
-    )
-    if len(files) > MAX_CACHE_FILES:
-        for f in files[:len(files) - MAX_CACHE_FILES]:
-            try:
-                os.remove(f)
-            except Exception:
-                pass
-
-@app.route("/poster/<filename>")
-def poster_serve(filename):
-    return send_from_directory(POSTER_CACHE, filename)
-
-def fetch_metadata(title, content_type="movie", max_tmdb_attempts=2):
-    key = f"{title}__{content_type}"
-    with cache_lock:
-        if key in metadata_cache:
-            return metadata_cache[key]
-    
-    cached_path = _cache_filename(title)
-    if os.path.exists(cached_path):
-        poster_url = f"/poster/{os.path.basename(cached_path)}"
-    else:
-        poster_url = None
-    
-    fallback = {
-        "title": title,
-        "poster": poster_url or "https://via.placeholder.com/500x750?text=No+Image",
-        "rating": 0.0,
-        "overview": "No overview available.",
-        "release_date": "N/A",
-        "source": "fallback"
-    }
-    
-    # TMDB for movies and series
-    if TMDB_API_KEY and content_type in ("movie", "movies", "series", "tv"):
-        endpoint = TMDB_SEARCH_MOVIE if "movie" in content_type else TMDB_SEARCH_TV
-        params = {"api_key": TMDB_API_KEY, "query": title, "language": "en-US", "page": 1}
-        for attempt in range(max_tmdb_attempts):
-            try:
-                r = session.get(endpoint, params=params, timeout=5)
-                r.raise_for_status()
-                data = r.json()
-                if data.get("results"):
-                    best = next((x for x in data["results"] if x.get("poster_path")), data["results"][0])
-                    poster_path = best.get("poster_path") or best.get("backdrop_path")
-                    if poster_path:
-                        poster_full = TMDB_IMAGE_BASE + poster_path
-                        try:
-                            img = session.get(poster_full, timeout=6).content
-                            with open(cached_path, "wb") as fh:
-                                fh.write(img)
-                            _manage_cache_size()
-                            poster_url = f"/poster/{os.path.basename(cached_path)}"
-                        except Exception:
-                            poster_url = poster_full
-                    result = {
-                        "title": best.get("title") or best.get("name") or title,
-                        "poster": poster_url or fallback["poster"],
-                        "rating": float(best.get("vote_average") or 0.0),
-                        "overview": best.get("overview") or fallback["overview"],
-                        "release_date": best.get("release_date") or best.get("first_air_date") or "N/A",
-                        "source": "tmdb"
-                    }
-                    with cache_lock:
-                        metadata_cache[key] = result
-                    return result
-                else:
-                    break
-            except requests.RequestException as e:
-                print(f"⚠️ TMDB fetch {attempt+1} failed for '{title}': {e}")
-                time.sleep(0.6)
-    
-    # Jikan for anime
-    if content_type == "anime":
-        try:
-            url = f"{JIKAN_SEARCH}?q={quote(title)}&limit=1"
-            r = session.get(url, timeout=6)
-            data = r.json()
-            if data.get("data"):
-                anime = data["data"][0]
-                poster_url_candidate = anime.get("images", {}).get("jpg", {}).get("large_image_url")
-                if poster_url_candidate:
-                    try:
-                        img = session.get(poster_url_candidate, timeout=6).content
-                        with open(cached_path, "wb") as fh:
-                            fh.write(img)
-                        _manage_cache_size()
-                        poster_url = f"/poster/{os.path.basename(cached_path)}"
-                    except Exception:
-                        poster_url = poster_url_candidate
-                result = {
-                    "title": anime.get("title_english") or anime.get("title") or title,
-                    "poster": poster_url or fallback["poster"],
-                    "rating": float(anime.get("score") or 0.0),
-                    "overview": anime.get("synopsis") or fallback["overview"],
-                    "release_date": (anime.get("aired", {}).get("from") or "N/A")[:10],
-                    "source": "jikan"
-                }
-                with cache_lock:
-                    metadata_cache[key] = result
-                return result
-        except Exception as e:
-            print(f"⚠️ Jikan fetch failed for '{title}': {e}")
-    
-    # Fallback: TMDB multi-search
-    if TMDB_API_KEY:
-        try:
-            endpoint = "https://api.themoviedb.org/3/search/multi"
-            params = {"api_key": TMDB_API_KEY, "query": title, "language": "en-US", "page": 1}
-            r = session.get(endpoint, params=params, timeout=5)
-            data = r.json()
-            if data.get("results"):
-                best = next((x for x in data["results"] if x.get("poster_path")), data["results"][0])
-                poster_path = best.get("poster_path")
-                poster_full = TMDB_IMAGE_BASE + poster_path if poster_path else None
-                if poster_full:
-                    try:
-                        img = session.get(poster_full, timeout=6).content
-                        with open(cached_path, "wb") as fh:
-                            fh.write(img)
-                        _manage_cache_size()
-                        poster_url = f"/poster/{os.path.basename(cached_path)}"
-                    except Exception:
-                        poster_url = poster_full
-                result = {
-                    "title": best.get("title") or best.get("name") or title,
-                    "poster": poster_url or fallback["poster"],
-                    "rating": float(best.get("vote_average") or 0.0),
-                    "overview": best.get("overview") or fallback["overview"],
-                    "release_date": best.get("release_date") or best.get("first_air_date") or "N/A",
-                    "source": "tmdb_multi"
-                }
-                with cache_lock:
-                    metadata_cache[key] = result
-                return result
-        except Exception:
-            pass
-    
-    with cache_lock:
-        metadata_cache[key] = fallback
-    return fallback
-
+# ───────────────────────────────
+# 🔹 Hybrid Recommendation API
+# ───────────────────────────────
 @app.route("/api/recommend", methods=["POST"])
-def api_recommend():
-    payload = request.get_json() or {}
-    title = str(payload.get("title", "")).strip()
-    c_type = str(payload.get("type", "")).strip().lower()
-    top_n = int(payload.get("top_n", 10))
-    
-    print(f"\n🔍 Recommendation request: title='{title}', type='{c_type}', top_n={top_n}")
-    
-    if not title:
-        return jsonify({"error": "Missing 'title' in request body."}), 400
-    
+def get_recommendations():
+    """Return hybrid recommendations for a given title (with fuzzy matching fallback)."""
     try:
-        recs_df = recommender.recommend(title, content_type=c_type or "movie", top_n=top_n)
-        
-        if recs_df is None or len(recs_df) == 0:
-            print(f"⚠️ No recommendations found for '{title}'")
-            meta = fetch_metadata(title, content_type=c_type or "movie")
-            return jsonify({
-                "error": f"Title '{title}' not found in dataset.",
-                "results": [],
-                "fallback": meta
-            }), 200
-        
-        print(f"✅ Found {len(recs_df)} recommendations")
-        enriched = []
-        
-        for i in range(len(recs_df)):
-            row = recs_df.iloc[i]
-            t = str(row.get("title", ""))
-            
-            # Fetch metadata
-            meta = fetch_metadata(t, content_type=c_type or "movie")
-            
-            # Build result with safe type conversions
-            result = {
-                "id": i + 1,  # Add unique ID for React key
-                "title": meta.get("title", t),
-                "poster": meta.get("poster", "https://via.placeholder.com/500x750?text=No+Image"),
-                "rating": float(meta.get("rating", 0)),
-                "overview": meta.get("overview", "No overview available."),
-                "release_date": meta.get("release_date", "N/A"),
-                "source": str(meta.get("source", "unknown")),
-                # Additional fields from recommender
-                "genre": str(row.get("genre", "")),
-                "similarity": float(row.get("similarity", 0)),
-                "final_score": float(row.get("final_score", 0)),
-                "type": str(row.get("type", "")),
-                "cluster": int(row.get("cluster", -1)),
-                "year": int(row.get("year", 0))
-            }
-            enriched.append(result)
-            print(f"  → {i+1}. {result['title']} (score: {result['final_score']:.3f})")
-        
-        print(f"✅ Returning {len(enriched)} enriched recommendations\n")
-        return jsonify({"query": title, "results": enriched}), 200
-        
-    except Exception as e:
-        import traceback
-        print("❌ Recommendation error:", e)
-        print(traceback.format_exc())
-        return jsonify({"error": str(e), "results": []}), 500
+        data = request.get_json()
+        title = data.get("title", "").strip()
+        top_k = int(data.get("top_k", 10))
+        type_ = data.get("type", "movie").lower()
 
-@app.route("/api/health", methods=["GET"])
-def health():
-    return jsonify({"status": "ok", "model_ready": True}), 200
+        if not title:
+            return jsonify({"success": False, "message": "❌ No title provided"}), 400
 
-@app.route("/api/test", methods=["GET"])
-def test():
-    """Test endpoint to verify backend is working"""
-    return jsonify({
-        "status": "ok",
-        "message": "Backend is running",
-        "sample_recommendation": {
-            "id": 1,
-            "title": "Test Movie",
-            "poster": "https://via.placeholder.com/500x750?text=Test+Movie",
-            "rating": 8.5,
-            "overview": "This is a test movie to verify the API structure.",
-            "release_date": "2024-01-01",
-            "source": "test",
-            "genre": "Action, Adventure",
-            "similarity": 0.95,
-            "final_score": 0.89,
-            "type": "movie",
-            "cluster": 5,
-            "year": 2024
+        # Normalize type for consistency
+        type_map = {
+            "tv": "series",
+            "show": "series",
+            "series": "series",
+            "film": "movie",
+            "movie": "movie",
+            "movies": "movie",
+            "anime": "anime",
+            "animes": "anime",
         }
-    }), 200
+        type_ = type_map.get(type_, "movie")
 
-# Handle OPTIONS for CORS
-@app.before_request
-def handle_options():
-    if request.method == "OPTIONS":
-        response = Response()
-        response.headers["Access-Control-Allow-Origin"] = "*"
-        response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
-        response.headers["Access-Control-Allow-Headers"] = "Content-Type"
-        return response
+        # Try to get recommendations directly
+        result = recommend(title, top_k=top_k)
 
+        # If not found, use fuzzy matching
+        if not result.get("success"):
+            all_titles = get_all_titles()  # Get all titles from your dataset
+            match, score = process.extractOne(title, all_titles)
+            if score >= 75:
+                print(f"🔍 Using fuzzy match: '{title}' → '{match}' (score: {score})")
+                result = recommend(match, top_k=top_k)
+            else:
+                return jsonify({
+                    "success": False,
+                    "message": f"'{title}' not found in dataset (no close match)."
+                }), 404
+
+        recs = result.get("results", [])
+        if recs:
+            max_sim = max(r.get("similarity", 0) for r in recs) or 1
+            for r in recs:
+                r["match_percent"] = round((r.get("similarity", 0) / max_sim) * 100, 1)
+                r["poster_url"] = get_poster_url(r["title"], r.get("type", type_))
+
+        return jsonify({"success": True, "results": recs}), 200
+
+    except Exception as e:
+        print("❌ Error in /api/recommend:", e)
+        return jsonify({"success": False, "message": str(e)}), 500
+
+
+# ───────────────────────────────
+# 🔹 Poster Fetch API
+# ───────────────────────────────
+@app.route("/api/poster/<string:title>", methods=["GET"])
+def get_poster(title):
+    """Return a poster URL for a given title with type-based fallback."""
+    try:
+        title = title.replace("%20", " ").strip()
+        content_type = request.args.get("type", "movie").lower()
+
+        type_map = {
+            "tv": "series",
+            "show": "series",
+            "series": "series",
+            "film": "movie",
+            "movie": "movie",
+            "movies": "movie",
+            "anime": "anime",
+            "animes": "anime",
+        }
+        content_type = type_map.get(content_type, "movie")
+
+        poster_url = get_poster_url(title, content_type)
+        return jsonify({"title": title, "type": content_type, "poster": poster_url}), 200
+
+    except Exception as e:
+        print(f"❌ Poster fetch error for {title}: {e}")
+        return jsonify({
+            "title": title,
+            "poster": "https://via.placeholder.com/500x750?text=Poster+Unavailable",
+            "error": str(e)
+        }), 500
+
+
+# ───────────────────────────────
+# 🔹 MongoDB Connection Test
+# ───────────────────────────────
+@app.route("/test_db", methods=["GET"])
+def test_db():
+    """Quick sanity test for MongoDB connection."""
+    try:
+        mongo.db.users.insert_one({"test": "ok"})
+        count = mongo.db.users.count_documents({})
+        return jsonify({"success": True, "count": count}), 200
+    except Exception as e:
+        print("❌ DB connection error:", e)
+        return jsonify({"success": False, "error": str(e)}), 500
+
+
+# ======================================
+# Run Server
+# ======================================
 if __name__ == "__main__":
-    print("🔹 Starting CineSense backend server...")
-    print(f"📂 Data directory: {DATA_DIR}")
-    print(f"🎬 TMDB API: {'✅ Configured' if TMDB_API_KEY else '❌ Not configured'}")
-    print(f"🖼️ Poster cache: {POSTER_CACHE}")
-    print(f"🚀 Server starting on http://0.0.0.0:{os.getenv('PORT', 5000)}\n")
-    app.run(debug=True, threaded=True, host="0.0.0.0", port=int(os.getenv("PORT", 5000)))
+    print("✅ Flask backend running at http://127.0.0.1:5000/api")
+    app.run(debug=True)

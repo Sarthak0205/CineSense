@@ -1,15 +1,36 @@
 import { useState, useEffect, useMemo } from "react";
 import { motion, AnimatePresence } from "framer-motion";
-import { useNavigate } from "react-router-dom"; // ✅ for navigation
+import { useNavigate } from "react-router-dom";
 
 const categories = ["movies", "series", "anime"];
 
 export default function LandingPage() {
-  const navigate = useNavigate(); // hook to navigate
+  const navigate = useNavigate();
   const [activeCategory, setActiveCategory] = useState("movies");
   const [fadeOverlay, setFadeOverlay] = useState(false);
 
-  // ✅ Memoized posters (prevents re-creation warnings)
+  // ✅ NEW: Track login state
+  const [loggedIn, setLoggedIn] = useState(false);
+  const [username, setUsername] = useState("");
+
+  useEffect(() => {
+    const token = localStorage.getItem("token");
+    const name = localStorage.getItem("username");
+    if (token && name) {
+      setLoggedIn(true);
+      setUsername(name);
+    }
+  }, []);
+
+  // ✅ NEW: Logout function
+  const handleLogout = () => {
+    localStorage.removeItem("token");
+    localStorage.removeItem("username");
+    localStorage.removeItem("email");
+    setLoggedIn(false);
+    navigate("/");
+  };
+
   const posters = useMemo(
     () => ({
       movies: [
@@ -43,13 +64,13 @@ export default function LandingPage() {
     []
   );
 
-  const buttons = [
-    { label: "Movies", key: "movies" },
-    { label: "Series", key: "series" },
-    { label: "Anime", key: "anime" },
-  ];
+  const handleCategorySelect = (key) => {
+    setFadeOverlay(true);
+    setTimeout(() => {
+      navigate(`/recommend?type=${key}`);
+    }, 800);
+  };
 
-  // 🎬 Smooth auto transitions
   useEffect(() => {
     const interval = setInterval(() => {
       setFadeOverlay(true);
@@ -62,24 +83,26 @@ export default function LandingPage() {
         setFadeOverlay(false);
       }, 1200);
     }, 10000);
-
     return () => clearInterval(interval);
   }, []);
-
-  // 🎯 Handle button click — fade and navigate
-  const handleCategorySelect = (key) => {
-    setFadeOverlay(true);
-    setTimeout(() => {
-      navigate(`/recommend?type=${key}`);
-    }, 800);
-  };
 
   return (
     <div className="relative min-h-screen flex flex-col justify-center items-center text-white overflow-hidden bg-gradient-to-b from-black via-[#0f172a] to-[#1e293b]">
 
-      {/* 🎞 Background Posters */}
+      {/* ✅ NEW - Welcome Message */}
+      {loggedIn && (
+        <motion.div
+          className="absolute top-6 right-6 z-30 bg-gray-900/50 px-4 py-2 rounded-xl border border-cyan-400/40 shadow-lg"
+          initial={{ opacity: 0, x: 30 }}
+          animate={{ opacity: 1, x: 0 }}
+        >
+          👋 Welcome, <span className="text-cyan-400 font-semibold">{username}</span>
+        </motion.div>
+      )}
+
+      {/* Background Posters */}
       <div className="absolute inset-0 overflow-hidden opacity-60">
-        <AnimatePresence mode="wait">
+        <AnimatePresence mode="sync">
           {posters[activeCategory]?.map((img, i) => (
             <motion.img
               key={`${activeCategory}-${img}`}
@@ -101,7 +124,7 @@ export default function LandingPage() {
         </AnimatePresence>
       </div>
 
-      {/* 🎥 Fade Overlay */}
+      {/* Fade Overlay */}
       <motion.div
         className="absolute inset-0 bg-black z-10"
         initial={{ opacity: 0 }}
@@ -111,18 +134,6 @@ export default function LandingPage() {
 
       {/* Gradient Overlay */}
       <div className="absolute inset-0 bg-gradient-to-b from-black/80 via-[#0f172a]/70 to-black/90 z-0" />
-
-      {/* Floating Orbs */}
-      <motion.div
-        className="absolute -top-20 -right-20 w-96 h-96 bg-cyan-500/20 rounded-full blur-3xl"
-        animate={{ y: [0, 30, 0], opacity: [0.4, 0.7, 0.4] }}
-        transition={{ duration: 7, repeat: Infinity, ease: "easeInOut" }}
-      />
-      <motion.div
-        className="absolute -bottom-20 -left-20 w-96 h-96 bg-blue-600/20 rounded-full blur-3xl"
-        animate={{ y: [0, -30, 0], opacity: [0.4, 0.7, 0.4] }}
-        transition={{ duration: 7, repeat: Infinity, ease: "easeInOut" }}
-      />
 
       {/* Title */}
       <motion.h1
@@ -136,7 +147,7 @@ export default function LandingPage() {
 
       {/* Tagline */}
       <motion.p
-        className="text-lg text-gray-300 mb-12 z-20"
+        className="text-lg text-gray-300 mb-12 z-20 text-center max-w-lg"
         initial={{ opacity: 0 }}
         animate={{ opacity: 1 }}
         transition={{ delay: 0.5, duration: 1 }}
@@ -144,50 +155,45 @@ export default function LandingPage() {
         Your next favorite show, revealed with precision ✨
       </motion.p>
 
-      {/* Buttons */}
+      {/* Category Buttons */}
       <div className="flex flex-wrap justify-center gap-8 z-20">
-        {buttons.map((btn, i) => (
-          <motion.div
-            key={btn.key}
-            className="relative"
-            onClick={() => handleCategorySelect(btn.key)}
-            initial={{ opacity: 0, y: 50 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.6 + i * 0.3, type: "spring", stiffness: 60 }}
+        {categories.map((key, i) => (
+          <motion.button
+            key={key}
+            onClick={() => handleCategorySelect(key)}
+            whileHover={{ scale: 1.05 }}
+            whileTap={{ scale: 0.95 }}
+            className={`px-10 py-4 text-xl font-semibold rounded-full ${
+              activeCategory === key
+                ? "bg-gradient-to-r from-blue-600 to-cyan-500 shadow-lg shadow-cyan-500/30"
+                : "bg-gradient-to-r from-gray-700 to-gray-900"
+            }`}
+            transition={{ delay: 0.2 + i * 0.2 }}
           >
-            {/* Pulse ring */}
-            <motion.div
-              className={`absolute -inset-2 rounded-full blur-xl opacity-40 ${
-                activeCategory === btn.key
-                  ? "bg-gradient-to-r from-cyan-500 to-blue-600"
-                  : "bg-gradient-to-r from-gray-600 to-gray-800"
-              }`}
-              animate={{ scale: [1, 1.15, 1] }}
-              transition={{
-                repeat: Infinity,
-                duration: 4 + i,
-                ease: "easeInOut",
-              }}
-            />
-            {/* Button */}
-            <motion.button
-              whileTap={{ scale: 0.95 }}
-              animate={{ y: [0, -6, 0] }}
-              transition={{
-                repeat: Infinity,
-                duration: 4 + i * 0.5,
-                ease: "easeInOut",
-              }}
-              className={`px-10 py-4 text-xl font-semibold rounded-full relative overflow-hidden ${
-                activeCategory === btn.key
-                  ? "bg-gradient-to-r from-blue-600 to-cyan-500"
-                  : "bg-gradient-to-r from-gray-700 to-gray-900"
-              } text-white`}
-            >
-              <span className="relative z-10">{btn.label}</span>
-            </motion.button>
-          </motion.div>
+            {key.charAt(0).toUpperCase() + key.slice(1)}
+          </motion.button>
         ))}
+      </div>
+
+      {/* ✅ AUTH Buttons Updated */}
+      <div className="flex flex-col sm:flex-row gap-5 mt-14 z-20">
+        {!loggedIn ? (
+          <motion.button
+            onClick={() => navigate("/auth")}
+            className="px-8 py-3 bg-purple-600 hover:bg-purple-700 rounded-full text-lg font-semibold shadow-lg shadow-purple-500/30"
+            whileHover={{ scale: 1.05 }}
+          >
+            Login / Register
+          </motion.button>
+        ) : (
+          <motion.button
+            onClick={handleLogout}
+            className="px-8 py-3 bg-red-600 hover:bg-red-700 rounded-full text-lg font-semibold shadow-lg shadow-red-500/30"
+            whileHover={{ scale: 1.05 }}
+          >
+            Logout
+          </motion.button>
+        )}
       </div>
 
       {/* Footer */}
