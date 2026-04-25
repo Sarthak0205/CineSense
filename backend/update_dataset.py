@@ -1,80 +1,112 @@
-import os
-import time
-import requests
 import pandas as pd
-from dotenv import load_dotenv
 
-# ───────────────────────────────
-# 🔹 Setup
-# ───────────────────────────────
-load_dotenv()
-TMDB_API_KEY = os.getenv("TMDB_API_KEY")
+INPUT_PATH = "data/final_dataset_refined.csv"
+OUTPUT_PATH = "data/final_dataset_v2.csv"
 
-INPUT_FILE = "data/final_dataset_final.csv"
-OUTPUT_FILE = "data/final_dataset_polished.csv"
+df = pd.read_csv(INPUT_PATH)
 
-# ───────────────────────────────
-# 🔹 Helper Function: Fetch Year from TMDB
-# ───────────────────────────────
-def fetch_year(title):
-    """Fetch release year from TMDB based on title."""
-    try:
-        url = f"https://api.themoviedb.org/3/search/multi"
-        params = {"api_key": TMDB_API_KEY, "query": title}
-        r = requests.get(url, params=params, timeout=8)
-        r.raise_for_status()
-        data = r.json()
-        if data["results"]:
-            item = data["results"][0]
-            date = item.get("release_date") or item.get("first_air_date")
-            if date and len(date) >= 4:
-                return int(date[:4])
-    except Exception:
-        pass
-    return 0  # return 0 if not found
+# -------------------------------------------------
+# 1️⃣ Clean & normalize base columns
+# -------------------------------------------------
+df["overview"] = df["overview"].fillna("").astype(str)
+df["genres"] = df["genres"].fillna("").astype(str).str.lower()
+df["type"] = df["type"].fillna("").astype(str).str.lower()
 
-# ───────────────────────────────
-# 🔹 Main Logic
-# ───────────────────────────────
-def fill_missing_years(limit=300):
-    print("📥 Loading dataset...")
-    df = pd.read_csv(INPUT_FILE)
-    print(f"✅ Loaded {len(df)} entries")
+# -------------------------------------------------
+# 2️⃣ Infer FORMAT (global, rule-based)
+# -------------------------------------------------
+def infer_format(row):
+    text = f"{row['overview']} {row['genres']}".lower()
+    t = row["type"]
 
-    missing_mask = (df["year"] == 0)
-    missing_count = missing_mask.sum()
-    print(f"🔍 Titles with missing year: {missing_count}")
+    # Anime
+    if t == "anime" or "anime" in text:
+        return "anime"
 
-    if missing_count == 0:
-        print("✅ No missing years found.")
-        return
+    # Sitcom / episodic comedy
+    if (
+        "sitcom" in text
+        or "group of friends" in text
+        or "roommates" in text
+        or "workplace comedy" in text
+        or ("comedy" in text and "series" in t)
+    ):
+        return "sitcom"
 
-    to_update = df[missing_mask].sample(min(limit, missing_count), random_state=42)
-    print(f"⚙️ Fetching years for {len(to_update)} titles...")
+    # Superhero
+    if any(k in text for k in ["superhero", "marvel", "dc comics"]):
+        return "superhero"
 
-    filled = 0
-    start_time = time.time()
+    # Crime drama
+    if any(k in text for k in ["crime", "drug", "gang", "cartel", "mafia"]):
+        return "crime-drama"
 
-    for idx, row in to_update.iterrows():
-        title = row["title"]
-        year = fetch_year(title)
-        if year:
-            df.at[idx, "year"] = year
-            filled += 1
+    # Thriller / mystery
+    if any(k in text for k in ["thriller", "mystery", "investigation"]):
+        return "thriller"
 
-        if filled % 20 == 0:
-            print(f"🔸 {filled} years filled so far...")
+    # Reality
+    if any(k in text for k in ["reality", "competition", "talent show"]):
+        return "reality"
 
-        time.sleep(0.25)  # small delay to avoid rate limits
+    # Family / light
+    if any(k in text for k in ["family", "kids", "children"]):
+        return "family"
 
-    duration = round(time.time() - start_time, 2)
-    print(f"\n✅ Filled {filled} years in {duration}s")
+    return "general"
 
-    df.to_csv(OUTPUT_FILE, index=False)
-    print(f"💾 Saved polished dataset → {OUTPUT_FILE}")
+df["format"] = df.apply(infer_format, axis=1)
 
-# ───────────────────────────────
-# 🔹 Run
-# ───────────────────────────────
-if __name__ == "__main__":
-    fill_missing_years(limit=300)
+# -------------------------------------------------
+# 3️⃣ Normalize GENRE TAGS (controlled vocabulary)
+# -------------------------------------------------
+GENRE_KEYWORDS = {
+    "sitcom": ["sitcom"],
+    "comedy": ["comedy", "humor"],
+    "crime": ["crime", "gang", "mafia"],
+    "thriller": ["thriller", "suspense"],
+    "psychological": ["psychological", "mind", "mental"],
+    "action": ["action", "fight", "battle"],
+    "adventure": ["adventure", "journey"],
+    "romance": ["romance", "love"],
+    "drama": ["drama"],
+    "superhero": ["superhero"],
+    "anime": ["anime"],
+    "sci-fi": ["sci-fi", "science fiction"],
+    "fantasy": ["fantasy", "magic"],
+}
+
+def build_genre_tags(text):
+    tags = set()
+    text = text.lower()
+    for tag, keys in GENRE_KEYWORDS.items():
+        if any(k in text for k in keys):
+            tags.add(tag)
+    return ", ".join(sorted(tags))
+
+df["genre_tags"] = df.apply(
+    lambda r: build_genre_tags(f"{r['genres']} {r['overview']} {r['format']}"),
+    axis=1
+)
+
+# -------------------------------------------------
+# 4️⃣ Final sanity checks
+# -------------------------------------------------
+# Ensure no empty formats
+df["format"] = df["format"].replace("", "general")
+
+# Ensure genre_tags is never empty
+df["genre_tags"] = df["genre_tags"].replace("", "general")
+
+# -------------------------------------------------
+# 5️⃣ Save refined dataset
+# -------------------------------------------------
+df.to_csv(OUTPUT_PATH, index=False)
+print(f"✅ Dataset refined and saved as: {OUTPUT_PATH}")
+
+# Optional: quick stats
+print("\n📊 Format distribution:")
+print(df["format"].value_counts().head(10))
+
+print("\n📊 Genre tag samples:")
+print(df["genre_tags"].value_counts().head(10))
